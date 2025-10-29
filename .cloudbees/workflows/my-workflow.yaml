@@ -1,16 +1,142 @@
 apiVersion: automation.cloudbees.io/v1alpha1
 kind: workflow
-name: My workflow
+name: Check My Endpoints
 on:
-  pull_request:
-    branches:
-      - "**"
   workflow_dispatch:
+    inputs:
+      endpoints:
+        type: string
+        description: 'Comma-separated list of endpoints to check (e.g., google.com:443,api.github.com:443)'
+        required: false
+        default: 'google.com:443,github.com:443,api.cloudbees.io:443'
+
 jobs:
-  build:
+  network-check:
     steps:
-      - name: Say hello
-        uses: docker://golang:1.20.3-alpine3.17
+      - name: Check Network Connectivity
+        uses: docker://nicolaka/netshoot:latest
         shell: sh
         run: |
-          echo "hello world"
+          echo "=========================================="
+          echo "Network Connectivity Check"
+          echo "=========================================="
+          echo ""
+          
+          # Parse endpoints from input (default if not provided)
+          ENDPOINTS="${{ inputs.endpoints }}"
+          if [ -z "$ENDPOINTS" ]; then
+            ENDPOINTS="google.com:443,github.com:443,api.cloudbees.io:443"
+          fi
+          
+          echo "Testing connectivity to the following endpoints:"
+          echo "$ENDPOINTS" | tr ',' '\n'
+          echo ""
+          echo "=========================================="
+          echo ""
+          
+          # Convert comma-separated list to array
+          IFS=',' read -ra ENDPOINT_ARRAY <<< "$ENDPOINTS"
+          
+          # Track results
+          SUCCESS_COUNT=0
+          FAIL_COUNT=0
+          
+          # Test each endpoint
+          for endpoint in "${ENDPOINT_ARRAY[@]}"; do
+            # Trim whitespace
+            endpoint=$(echo "$endpoint" | xargs)
+            
+            # Split host and port
+            HOST=$(echo "$endpoint" | cut -d':' -f1)
+            PORT=$(echo "$endpoint" | cut -d':' -f2)
+            
+            # Default to port 443 if not specified
+            if [ "$HOST" = "$PORT" ]; then
+              PORT=443
+            fi
+            
+            echo "-------------------------------------------"
+            echo "Testing: $HOST:$PORT"
+            echo "-------------------------------------------"
+            
+            # DNS lookup
+            echo "DNS Lookup:"
+            if nslookup "$HOST" > /dev/null 2>&1; then
+              IP=$(nslookup "$HOST" | grep -A1 "Name:" | grep "Address:" | tail -1 | awk '{print $2}')
+              echo "✓ DNS resolution successful: $HOST -> $IP"
+            else
+              echo "✗ DNS resolution failed for $HOST"
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              echo ""
+              continue
+            fi
+            
+            # TCP connectivity check
+            echo ""
+            echo "TCP Connectivity:"
+            if timeout 5 nc -zv "$HOST" "$PORT" 2>&1 | grep -q "succeeded\|open"; then
+              echo "✓ TCP connection successful to $HOST:$PORT"
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            else
+              echo "✗ TCP connection failed to $HOST:$PORT"
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+            fi
+            
+            # HTTP/HTTPS check for common web ports
+            if [ "$PORT" = "443" ] || [ "$PORT" = "80" ]; then
+              echo ""
+              echo "HTTP/HTTPS Check:"
+              PROTOCOL="https"
+              if [ "$PORT" = "80" ]; then
+                PROTOCOL="http"
+              fi
+              
+              if curl -Is --connect-timeout 5 --max-time 10 "$PROTOCOL://$HOST" | head -1 | grep -q "HTTP"; then
+                STATUS=$(curl -Is --connect-timeout 5 --max-time 10 "$PROTOCOL://$HOST" | head -1)
+                echo "✓ HTTP(S) response received: $STATUS"
+              else
+                echo "✗ No HTTP(S) response from $HOST"
+              fi
+            fi
+            
+            echo ""
+          done
+          
+          echo "=========================================="
+          echo "Summary"
+          echo "=========================================="
+          echo "Total endpoints tested: $((SUCCESS_COUNT + FAIL_COUNT))"
+          echo "Successful connections: $SUCCESS_COUNT"
+          echo "Failed connections: $FAIL_COUNT"
+          echo ""
+          
+          # Exit with error if any checks failed
+          if [ $FAIL_COUNT -gt 0 ]; then
+            echo "⚠️  Some connectivity checks failed!"
+            exit 1
+          else
+            echo "✓ All connectivity checks passed!"
+            exit 0
+          fi
+
+      - name: Additional Network Info
+        uses: docker://nicolaka/netshoot:latest
+        shell: sh
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "Additional Network Information"
+          echo "=========================================="
+          echo ""
+          
+          echo "--- Network Interfaces ---"
+          ip addr show
+          echo ""
+          
+          echo "--- Routing Table ---"
+          ip route show
+          echo ""
+          
+          echo "--- DNS Configuration ---"
+          cat /etc/resolv.conf
+          echo ""
