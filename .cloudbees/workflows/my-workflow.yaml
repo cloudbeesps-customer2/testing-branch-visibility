@@ -1,6 +1,7 @@
 apiVersion: automation.cloudbees.io/v1alpha1
 kind: workflow
-name: Check My Endpoints
+name: Network Connectivity Check
+
 on:
   workflow_dispatch:
     inputs:
@@ -34,17 +35,19 @@ jobs:
           echo "=========================================="
           echo ""
           
-          # Convert comma-separated list to array
-          IFS=',' read -ra ENDPOINT_ARRAY <<< "$ENDPOINTS"
+          # Use temp file to track results (avoid subshell issues)
+          RESULT_FILE="/tmp/network_check_results.txt"
+          echo "0" > "$RESULT_FILE"  # SUCCESS_COUNT
+          echo "0" >> "$RESULT_FILE" # FAIL_COUNT
           
-          # Track results
-          SUCCESS_COUNT=0
-          FAIL_COUNT=0
-          
-          # Test each endpoint
-          for endpoint in "${ENDPOINT_ARRAY[@]}"; do
+          # Test each endpoint (POSIX-compliant)
+          OLD_IFS="$IFS"
+          IFS=','
+          for endpoint in $ENDPOINTS; do
+            IFS="$OLD_IFS"
+            
             # Trim whitespace
-            endpoint=$(echo "$endpoint" | xargs)
+            endpoint=$(echo "$endpoint" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             
             # Split host and port
             HOST=$(echo "$endpoint" | cut -d':' -f1)
@@ -66,8 +69,12 @@ jobs:
               echo "✓ DNS resolution successful: $HOST -> $IP"
             else
               echo "✗ DNS resolution failed for $HOST"
+              # Increment FAIL_COUNT
+              FAIL_COUNT=$(sed -n '2p' "$RESULT_FILE")
               FAIL_COUNT=$((FAIL_COUNT + 1))
+              sed -i "2s/.*/$FAIL_COUNT/" "$RESULT_FILE"
               echo ""
+              IFS=','
               continue
             fi
             
@@ -76,10 +83,16 @@ jobs:
             echo "TCP Connectivity:"
             if timeout 5 nc -zv "$HOST" "$PORT" 2>&1 | grep -q "succeeded\|open"; then
               echo "✓ TCP connection successful to $HOST:$PORT"
+              # Increment SUCCESS_COUNT
+              SUCCESS_COUNT=$(sed -n '1p' "$RESULT_FILE")
               SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              sed -i "1s/.*/$SUCCESS_COUNT/" "$RESULT_FILE"
             else
               echo "✗ TCP connection failed to $HOST:$PORT"
+              # Increment FAIL_COUNT
+              FAIL_COUNT=$(sed -n '2p' "$RESULT_FILE")
               FAIL_COUNT=$((FAIL_COUNT + 1))
+              sed -i "2s/.*/$FAIL_COUNT/" "$RESULT_FILE"
             fi
             
             # HTTP/HTTPS check for common web ports
@@ -91,8 +104,8 @@ jobs:
                 PROTOCOL="http"
               fi
               
-              if curl -Is --connect-timeout 5 --max-time 10 "$PROTOCOL://$HOST" | head -1 | grep -q "HTTP"; then
-                STATUS=$(curl -Is --connect-timeout 5 --max-time 10 "$PROTOCOL://$HOST" | head -1)
+              if curl -Is --connect-timeout 5 --max-time 10 "$PROTOCOL://$HOST" 2>/dev/null | head -1 | grep -q "HTTP"; then
+                STATUS=$(curl -Is --connect-timeout 5 --max-time 10 "$PROTOCOL://$HOST" 2>/dev/null | head -1)
                 echo "✓ HTTP(S) response received: $STATUS"
               else
                 echo "✗ No HTTP(S) response from $HOST"
@@ -100,7 +113,13 @@ jobs:
             fi
             
             echo ""
+            IFS=','
           done
+          IFS="$OLD_IFS"
+          
+          # Read final counts
+          SUCCESS_COUNT=$(sed -n '1p' "$RESULT_FILE")
+          FAIL_COUNT=$(sed -n '2p' "$RESULT_FILE")
           
           echo "=========================================="
           echo "Summary"
@@ -110,8 +129,11 @@ jobs:
           echo "Failed connections: $FAIL_COUNT"
           echo ""
           
+          # Clean up
+          rm -f "$RESULT_FILE"
+          
           # Exit with error if any checks failed
-          if [ $FAIL_COUNT -gt 0 ]; then
+          if [ "$FAIL_COUNT" -gt 0 ]; then
             echo "⚠️  Some connectivity checks failed!"
             exit 1
           else
